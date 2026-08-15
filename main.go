@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/bootdotdev/learn-cicd-starter/internal/database"
+	"github.com/go-chi/chi/"
+	"github.com/go-chi/cors"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
 )
@@ -19,7 +21,7 @@ type apiConfig struct {
 func main() {
 	err := godotenv.Load(".env")
 	if err != nil {
-		log.Println("Warning: .env file not found, continuing with default environment")
+		log.Println("Warning: .env file not found, continuing with environment variables")
 	}
 
 	portString := os.Getenv("PORT")
@@ -41,15 +43,27 @@ func main() {
 		DB: database.New(conn),
 	}
 
-	router := http.NewServeMux()
+	router := chi.NewRouter()
 
-	router.HandleFunc("GET /v1/healthz", handlerReadiness)
-	router.HandleFunc("GET /v1/err", handlerErr)
+	router.Use(cors.Handler(cors.Options{
+		AllowedOrigins:   []string{"https://*"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"*"},
+		ExposedHeaders:   []string{"Link"},
+		MaxAge:           300,
+		AllowCredentials: true,
+	}))
 
-	router.HandleFunc("POST /v1/users", apiCfg.handlerUsersCreate)
+	v1Router := chi.NewRouter()
+	v1Router.Get("/healthz", handlerReadiness)
+	v1Router.Get("/err", handlerErr)
 
-	router.HandleFunc("POST /v1/notes", apiCfg.handlerNotesCreate)
-	router.HandleFunc("GET /v1/notes", apiCfg.handlerNotesGet)
+	v1Router.Post("/users", apiCfg.handlerUsersCreate)
+
+	v1Router.Post("/notes", apiCfg.middlewareAuth(apiCfg.handlerNotesCreate))
+	v1Router.Get("/notes", apiCfg.middlewareAuth(apiCfg.handlerNotesGet))
+
+	router.Mount("/v1", v1Router)
 
 	srv := &http.Server{
 		Addr:         ":" + portString,
