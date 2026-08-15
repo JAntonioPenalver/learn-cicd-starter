@@ -1,15 +1,18 @@
 #!/bin/bash
 
-# Si DATABASE_URL no está definida, intenta usar DB_URL
-if [ -z "$DATABASE_URL" ]; then
-  DATABASE_URL="$DB_URL"
-fi
+# Usar DATABASE_URL o DB_URL
+URL="${DATABASE_URL:-$DB_URL}"
 
-# Si aún no hay URL, lanza error
-if [ -z "$DATABASE_URL" ]; then
+if [ -z "$URL" ]; then
   echo "Error: DATABASE_URL is not set"
   exit 1
 fi
 
+# Eliminar comillas dobles o simples que hayan quedado en la variable
+CLEAN_URL=$(echo "$URL" | tr -d '"' | tr -d "'")
+
+# Navegar a la carpeta donde están los archivos .sql
 cd sql/schema || exit 1
-goose turso "$DATABASE_URL" up
+
+# Ejecutar las migraciones
+goose turso "$CLEAN_URL" up
