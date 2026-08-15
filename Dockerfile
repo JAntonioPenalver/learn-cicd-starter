@@ -7,7 +7,6 @@ RUN go mod download
 
 COPY . .
 
-# Compilar el ejecutable estático
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o notely .
 
 FROM alpine:latest
@@ -16,11 +15,15 @@ RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 
-# Copiar el ejecutable y los recursos estáticos
+# Copia el binario
 COPY --from=builder /app/notely /app/notely
+
+# Copia la carpeta static completa
 COPY --from=builder /app/static /app/static
 
-# Asignar permisos
+# Copia los archivos estáticos a la raíz de /app por si el FileServer apunta a "."
+COPY --from=builder /app/static/* /app/
+
 RUN chmod +x /app/notely
 
 ENV PORT=8080

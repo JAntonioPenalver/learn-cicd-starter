@@ -1,8 +1,8 @@
-name: CD
+name: cd
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
   deploy:
@@ -10,34 +10,34 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
+      - name: Check out code
+        uses: actions/checkout@v4
 
-    - name: Set up Go
-      uses: actions/setup-go@v5
-      with:
-        go-version: '1.22'
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
 
-    - name: Build production app
-      run: ./scripts/buildprod.sh
+      - name: Build app
+        run: ./scripts/buildprod.sh
 
-    - name: Authenticate to Google Cloud
-      uses: google-github-actions/auth@v2
-      with:
-        credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+      - id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
 
-    - name: Set up Cloud SDK
-      uses: google-github-actions/setup-gcloud@v2
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
 
-    - name: Build and Push Docker Image
-      run: gcloud builds submit --tag us-central1-docker.pkg.dev/notely-cicd-505615/notely-ar-repo/notely:latest .
+      - name: Build and push Docker image
+        run: gcloud builds submit --tag us-central1-docker.pkg.dev/notely-cicd-505615/notely-ar-repo/notely:latest .
 
-    - name: Deploy to Cloud Run
-      run: |
-        gcloud run deploy notely \
-          --image us-central1-docker.pkg.dev/notely-cicd-505615/notely-ar-repo/notely:latest \
-          --region us-central1 \
-          --allow-unauthenticated \
-          --project notely-cicd-505615 \
-          --max-instances=4 \
-          --set-env-vars="DB_URL=dummy"
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run deploy notely \
+            --image us-central1-docker.pkg.dev/notely-cicd-505615/notely-ar-repo/notely:latest \
+            --region us-central1 \
+            --allow-unauthenticated \
+            --project notely-cicd-505615 \
+            --max-instances=4 \
+            --set-env-vars="DB_URL=dummy"
