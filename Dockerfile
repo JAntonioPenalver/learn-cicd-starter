@@ -15,12 +15,13 @@ RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 
-COPY --from=builder /app/notely /app/notely
-COPY --from=builder /app/static /app/static
+COPY --from=builder /app/notely .
+COPY --from=builder /app/static ./static
+COPY --from=builder /app/static/index.html ./index.html
 
-RUN chmod +x /app/notely
+RUN chmod +x ./notely
 
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["/app/notely"]
+CMD ["./notely"]
