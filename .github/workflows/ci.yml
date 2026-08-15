@@ -36,3 +36,9 @@ jobs:
 
       - name: Check formatting
         run: test -z $(go fmt ./...)
+
+      - name: Run staticcheck
+        uses: dominikh/staticcheck-action@v1.3.1
+        with:
+          version: "2023.1.6"
+          install-go: false
