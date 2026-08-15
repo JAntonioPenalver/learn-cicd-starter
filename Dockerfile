@@ -1,32 +1,31 @@
-# Etapa 1: Compilación
 FROM golang:1.22-alpine AS builder
 
 WORKDIR /app
 
-# Copia los archivos de definición de módulos Go
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copia todo el código fuente y assets de Notely
 COPY . .
 
-# Compila el ejecutable estático para Linux
+# Compilamos el binario de Go para Linux de 64 bits
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o notely .
 
-# Etapa 2: Imagen final de producción
 FROM alpine:latest
 
 RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 
-# Copia el binario y TODOS los archivos estáticos/recursos
+# Copiamos todo lo necesario desde el builder
 COPY --from=builder /app/notely /app/notely
 COPY --from=builder /app/static /app/static
 
-# Asigna permisos de ejecución
+# Copiamos archivos de configuración si existen
+COPY --from=builder /app/.env* /app/
+
 RUN chmod +x /app/notely
 
+# Variable de puerto estándar requerida por Cloud Run
 ENV PORT=8080
 EXPOSE 8080
 
