@@ -66,6 +66,9 @@ func main() {
 
 	router.Mount("/v1", v1Router)
 
+	fs := http.FileServer(http.Dir("."))
+	router.Handle("/*", fs)
+
 	srv := &http.Server{
 		Addr:         ":" + portString,
 		Handler:      router,
