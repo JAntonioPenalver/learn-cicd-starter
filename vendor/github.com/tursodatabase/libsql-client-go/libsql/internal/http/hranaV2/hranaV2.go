@@ -13,7 +13,8 @@ import (
 	net_url "net/url"
 	"runtime/debug"
 	"strings"
-	"time"
+
+	"github.com/tursodatabase/libsql-client-go/sqliteparserutils"
 
 	"github.com/tursodatabase/libsql-client-go/libsql/internal/hrana"
 	"github.com/tursodatabase/libsql-client-go/libsql/internal/http/shared"
@@ -36,8 +37,8 @@ func init() {
 	commitHash = "unknown"
 }
 
-func Connect(url, jwt, host string) driver.Conn {
-	return &hranaV2Conn{url, jwt, host, "", false, 0}
+func Connect(url, jwt, host string, schemaDb bool, encryptionKey string, requestHeaders map[string]string) driver.Conn {
+	return &hranaV2Conn{url, jwt, host, schemaDb, encryptionKey, requestHeaders, "", false, 0}
 }
 
 type hranaV2Stmt struct {
@@ -82,12 +83,15 @@ func (s *hranaV2Stmt) QueryContext(ctx context.Context, args []driver.NamedValue
 }
 
 type hranaV2Conn struct {
-	url              string
-	jwt              string
-	host             string
-	baton            string
-	streamClosed     bool
-	replicationIndex uint64
+	url                 string
+	jwt                 string
+	host                string
+	schemaDb            bool
+	remoteEncryptionKey string
+	requestHeaders      map[string]string
+	baton               string
+	streamClosed        bool
+	replicationIndex    uint64
 }
 
 func (h *hranaV2Conn) Ping() error {
@@ -120,11 +124,11 @@ func (h *hranaV2Conn) PrepareContext(ctx context.Context, query string) (driver.
 
 func (h *hranaV2Conn) Close() error {
 	if h.baton != "" {
-		go func(baton, url, jwt, host string) {
+		go func(baton, url, jwt, host, encryptionKey string, requestHeaders map[string]string) {
 			msg := hrana.PipelineRequest{Baton: baton}
 			msg.Add(hrana.CloseStream())
-			_, _, _ = sendPipelineRequest(context.Background(), &msg, url, jwt, host)
-		}(h.baton, h.url, h.jwt, h.host)
+			_, _, _ = sendPipelineRequest(context.Background(), &msg, url, jwt, host, encryptionKey, requestHeaders)
+		}(h.baton, h.url, h.jwt, h.host, h.remoteEncryptionKey, h.requestHeaders)
 	}
 	return nil
 }
@@ -172,7 +176,7 @@ func (h *hranaV2Conn) sendPipelineRequest(ctx context.Context, msg *hrana.Pipeli
 	if h.replicationIndex > 0 {
 		addReplicationIndex(msg, h.replicationIndex)
 	}
-	result, streamClosed, err := sendPipelineRequest(ctx, msg, h.url, h.jwt, h.host)
+	result, streamClosed, err := sendPipelineRequest(ctx, msg, h.url, h.jwt, h.host, h.remoteEncryptionKey, h.requestHeaders)
 	if streamClosed {
 		h.streamClosed = true
 	}
@@ -229,13 +233,11 @@ func getReplicationIndex(response *hrana.PipelineResponse) uint64 {
 	return replicationIndex
 }
 
-func sendPipelineRequest(ctx context.Context, msg *hrana.PipelineRequest, url string, jwt string, host string) (result hrana.PipelineResponse, streamClosed bool, err error) {
+func sendPipelineRequest(ctx context.Context, msg *hrana.PipelineRequest, url string, jwt string, host string, remoteEncryptionKey string, requestHeaders map[string]string) (result hrana.PipelineResponse, streamClosed bool, err error) {
 	reqBody, err := json.Marshal(msg)
 	if err != nil {
 		return hrana.PipelineResponse{}, false, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
 	pipelineURL, err := net_url.JoinPath(url, "/v2/pipeline")
 	if err != nil {
 		return hrana.PipelineResponse{}, false, err
@@ -248,7 +250,14 @@ func sendPipelineRequest(ctx context.Context, msg *hrana.PipelineRequest, url st
 		req.Header.Set("Authorization", "Bearer "+jwt)
 	}
 	req.Header.Set("x-libsql-client-version", "libsql-remote-go-"+commitHash)
+	if remoteEncryptionKey != "" {
+		req.Header.Set("x-turso-encryption-key", remoteEncryptionKey)
+	}
+
 	req.Host = host
+	for name, value := range requestHeaders {
+		req.Header.Set(name, value)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return hrana.PipelineResponse{}, false, err
@@ -285,38 +294,156 @@ func sendPipelineRequest(ctx context.Context, msg *hrana.PipelineRequest, url st
 	return result, false, nil
 }
 
+func (h *hranaV2Conn) executeMsg(ctx context.Context, msg *hrana.PipelineRequest) (*hrana.PipelineResponse, error) {
+	result, err := h.sendPipelineRequest(ctx, msg, false)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, r := range result.Results {
+		if r.Error != nil {
+			return nil, errors.New(r.Error.Message)
+		}
+		if r.Response == nil {
+			return nil, errors.New("no response received")
+		}
+	}
+	return result, nil
+}
+
+type chunker struct {
+	chunk    []string
+	iterator *sqliteparserutils.StatementIterator
+	limit    int
+}
+
+func newChunker(iterator *sqliteparserutils.StatementIterator, limit int) *chunker {
+	return &chunker{iterator: iterator, chunk: make([]string, 0, limit), limit: limit}
+}
+
+func isTransactionStatement(stmt string) bool {
+	patterns := [][]byte{[]byte("begin"), []byte("commit"), []byte("end"), []byte("rollback")}
+	for _, p := range patterns {
+		if len(stmt) >= len(p) && bytes.Equal(bytes.ToLower([]byte(stmt[0:len(p)])), p) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *chunker) Next() (chunk []string, isEOF bool) {
+	c.chunk = c.chunk[:0]
+	var stmt string
+	for !isEOF && len(c.chunk) < c.limit {
+		stmt, _, isEOF = c.iterator.Next()
+		// We need to skip transaction statements. Chunks run in a transaction by default.
+		if stmt != "" && !isTransactionStatement(stmt) {
+			c.chunk = append(c.chunk, stmt)
+		}
+	}
+	return c.chunk, isEOF
+}
+
+func (h *hranaV2Conn) executeSingleStmt(ctx context.Context, stmt string, wantRows bool) (*hrana.PipelineResponse, error) {
+	msg := &hrana.PipelineRequest{}
+	executeStream, err := hrana.ExecuteStream(stmt, nil, wantRows)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute SQL: %s\n%w", stmt, err)
+	}
+	msg.Add(*executeStream)
+	res, err := h.executeMsg(ctx, msg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to execute SQL: %s\n%w", stmt, err)
+	}
+	return res, nil
+}
+
+func (h *hranaV2Conn) executeInChunks(ctx context.Context, query string, wantRows bool) (*hrana.PipelineResponse, error) {
+	const chunkSize = 4096
+	iterator := sqliteparserutils.CreateStatementIterator(query)
+	chunker := newChunker(iterator, chunkSize)
+
+	chunk, isEOF := chunker.Next()
+	if isEOF && len(chunk) == 1 {
+		return h.executeSingleStmt(ctx, chunk[0], wantRows)
+	}
+
+	_, err := h.executeSingleStmt(ctx, "BEGIN", false)
+	if err != nil {
+		return nil, err
+	}
+
+	batch := &hrana.Batch{Steps: make([]hrana.BatchStep, chunkSize)}
+	msg := &hrana.PipelineRequest{}
+	msg.Add(hrana.StreamRequest{Type: "batch", Batch: batch})
+	for idx := range batch.Steps {
+		batch.Steps[idx].Stmt.WantRows = wantRows
+	}
+
+	result := &hrana.PipelineResponse{}
+	for {
+		for idx := range chunk {
+			batch.Steps[idx].Stmt.Sql = &chunk[idx]
+		}
+		if len(chunk) < chunkSize {
+			// We can trim batch.Steps because this is the last chunk anyway.
+			// isEOF has to be true at this point.
+			batch.Steps = batch.Steps[:len(chunk)]
+		}
+		res, err := h.executeMsg(ctx, msg)
+		if err != nil {
+			h.closeStream()
+			return nil, fmt.Errorf("failed to execute SQL:\n%w", err)
+		}
+		result.Baton = res.Baton
+		result.BaseUrl = res.BaseUrl
+		result.Results = append(result.Results, res.Results...)
+		if isEOF {
+			break
+		}
+		chunk, isEOF = chunker.Next()
+	}
+	_, err = h.executeSingleStmt(ctx, "COMMIT", false)
+	if err != nil {
+		h.closeStream()
+		return nil, err
+	}
+	return result, nil
+}
+
 func (h *hranaV2Conn) executeStmt(ctx context.Context, query string, args []driver.NamedValue, wantRows bool) (*hrana.PipelineResponse, error) {
+	const querySizeLimitForChunking = 20 * 1024 * 1024
+	if len(args) == 0 && len(query) > querySizeLimitForChunking && !h.schemaDb {
+		return h.executeInChunks(ctx, query, wantRows)
+	}
 	stmts, params, err := shared.ParseStatementAndArgs(query, args)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute SQL: %s\n%w", query, err)
+		return nil, fmt.Errorf("failed to execute SQL:\n%w", err)
 	}
 	msg := &hrana.PipelineRequest{}
 	if len(stmts) == 1 {
-		executeStream, err := hrana.ExecuteStream(stmts[0], params[0], wantRows)
+		var p *shared.Params
+		if len(params) > 0 {
+			p = &params[0]
+		}
+		executeStream, err := hrana.ExecuteStream(stmts[0], p, wantRows)
 		if err != nil {
-			return nil, fmt.Errorf("failed to execute SQL: %s\n%w", query, err)
+			return nil, fmt.Errorf("failed to execute SQL:\n%w", err)
 		}
 		msg.Add(*executeStream)
 	} else {
-		batchStream, err := hrana.BatchStream(stmts, params, wantRows)
+		batchStream, err := hrana.BatchStream(stmts, params, wantRows, !h.schemaDb)
 		if err != nil {
-			return nil, fmt.Errorf("failed to execute SQL: %s\n%w", query, err)
+			return nil, fmt.Errorf("failed to execute SQL:\n%w", err)
 		}
 		msg.Add(*batchStream)
 	}
 
-	result, err := h.sendPipelineRequest(ctx, msg, false)
+	resp, err := h.executeMsg(ctx, msg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to execute SQL: %s\n%w", query, err)
+		return nil, fmt.Errorf("failed to execute SQL:\n%w", err)
 	}
-
-	if result.Results[0].Error != nil {
-		return nil, fmt.Errorf("failed to execute SQL: %s\n%s", query, result.Results[0].Error.Message)
-	}
-	if result.Results[0].Response == nil {
-		return nil, fmt.Errorf("failed to execute SQL: %s\n%s", query, "no response received")
-	}
-	return result, nil
+	return resp, nil
 }
 
 func (h *hranaV2Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -338,7 +465,12 @@ func (h *hranaV2Conn) ExecContext(ctx context.Context, query string, args []driv
 		}
 		lastInsertRowId := int64(0)
 		affectedRowCount := int64(0)
-		for _, r := range res.StepResults {
+		upperBound := len(res.StepResults)
+		if !h.schemaDb {
+			upperBound -= 1
+		}
+		for idx := 0; idx < upperBound; idx++ {
+			r := res.StepResults[idx]
 			rowId := r.GetLastInsertRowId()
 			if rowId > 0 {
 				lastInsertRowId = rowId
@@ -457,20 +589,28 @@ func (h *hranaV2Conn) QueryContext(ctx context.Context, query string, args []dri
 		if err != nil {
 			return nil, err
 		}
+		if !h.schemaDb {
+			res.StepResults = res.StepResults[:len(res.StepResults)-1]
+			res.StepErrors = res.StepErrors[:len(res.StepErrors)-1]
+		}
 		return shared.NewRows(&BatchResultRowsProvider{res}), nil
 	default:
 		return nil, fmt.Errorf("failed to execute SQL: %s\n%s", query, "unknown response type")
 	}
 }
 
-func (h *hranaV2Conn) ResetSession(ctx context.Context) error {
+func (h *hranaV2Conn) closeStream() {
 	if h.baton != "" {
-		go func(baton, url, jwt, host string) {
+		go func(baton, url, jwt, host, encryptionKey string, requestHeaders map[string]string) {
 			msg := hrana.PipelineRequest{Baton: baton}
 			msg.Add(hrana.CloseStream())
-			_, _, _ = sendPipelineRequest(context.Background(), &msg, url, jwt, host)
-		}(h.baton, h.url, h.jwt, h.host)
+			_, _, _ = sendPipelineRequest(context.Background(), &msg, url, jwt, host, encryptionKey, requestHeaders)
+		}(h.baton, h.url, h.jwt, h.host, h.remoteEncryptionKey, h.requestHeaders)
 		h.baton = ""
 	}
+}
+
+func (h *hranaV2Conn) ResetSession(ctx context.Context) error {
+	h.closeStream()
 	return nil
 }
