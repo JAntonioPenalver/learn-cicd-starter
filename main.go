@@ -2,97 +2,83 @@ package main
 
 import (
 	"database/sql"
-	"embed"
-	"io"
 	"log"
 	"net/http"
 	"os"
+	"time"
 
+	"github.com/bootdotdev/learn-cicd-starter/internal/database"
 	"github.com/go-chi/chi"
 	"github.com/go-chi/cors"
 	"github.com/joho/godotenv"
-
-	"github.com/bootdotdev/learn-cicd-starter/internal/database"
-
-	_ "github.com/tursodatabase/libsql-client-go/libsql"
+	_ "github.com/lib/pq"
 )
 
 type apiConfig struct {
 	DB *database.Queries
 }
 
-//go:embed static/*
-var staticFiles embed.FS
-
 func main() {
 	err := godotenv.Load(".env")
 	if err != nil {
-		log.Printf("warning: assuming default configuration. .env unreadable: %v", err)
+		log.Println("Warning: .env file not found, continuing with environment variables")
 	}
 
-	port := os.Getenv("PORT")
-	if port == "" {
-		log.Fatal("PORT environment variable is not set")
+	portString := os.Getenv("PORT")
+	if portString == "" {
+		log.Fatal("PORT is not set in environment")
 	}
 
-	apiCfg := apiConfig{}
-
-	// https://github.com/libsql/libsql-client-go/#open-a-connection-to-sqld
-	// libsql://[your-database].turso.io?authToken=[your-auth-token]
-	dbURL := os.Getenv("DATABASE_URL")
+	dbURL := os.Getenv("DB_URL")
 	if dbURL == "" {
-		log.Println("DATABASE_URL environment variable is not set")
-		log.Println("Running without CRUD endpoints")
-	} else {
-		db, err := sql.Open("libsql", dbURL)
-		if err != nil {
-			log.Fatal(err)
-		}
-		dbQueries := database.New(db)
-		apiCfg.DB = dbQueries
-		log.Println("Connected to database!")
+		log.Fatal("DB_URL is not set in environment")
+	}
+
+	conn, err := sql.Open("postgres", dbURL)
+	if err != nil {
+		log.Fatal("Can't connect to database:", err)
+	}
+
+	apiCfg := apiConfig{
+		DB: database.New(conn),
 	}
 
 	router := chi.NewRouter()
 
 	router.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"https://*", "http://*"},
+		AllowedOrigins:   []string{"https://*"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"*"},
 		ExposedHeaders:   []string{"Link"},
-		AllowCredentials: false,
 		MaxAge:           300,
+		AllowCredentials: true,
 	}))
 
-	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
-		f, err := staticFiles.Open("static/index.html")
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		defer f.Close()
-		if _, err := io.Copy(w, f); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-	})
-
 	v1Router := chi.NewRouter()
-
-	if apiCfg.DB != nil {
-		v1Router.Post("/users", apiCfg.handlerUsersCreate)
-		v1Router.Get("/users", apiCfg.middlewareAuth(apiCfg.handlerUsersGet))
-		v1Router.Get("/notes", apiCfg.middlewareAuth(apiCfg.handlerNotesGet))
-		v1Router.Post("/notes", apiCfg.middlewareAuth(apiCfg.handlerNotesCreate))
-	}
-
 	v1Router.Get("/healthz", handlerReadiness)
+	v1Router.Get("/err", handlerErr)
+
+	v1Router.Post("/users", apiCfg.handlerUsersCreate)
+	v1Router.Get("/users", apiCfg.middlewareAuth(apiCfg.handlerUsersGet))
+
+	v1Router.Post("/notes", apiCfg.middlewareAuth(apiCfg.handlerNotesCreate))
+	v1Router.Get("/notes", apiCfg.middlewareAuth(apiCfg.handlerNotesGet))
 
 	router.Mount("/v1", v1Router)
+
+	fs := http.FileServer(http.Dir("."))
+	router.Handle("/*", fs)
+
 	srv := &http.Server{
-		Addr:    ":" + port,
-		Handler: router,
+		Addr:         ":" + portString,
+		Handler:      router,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 
-	log.Printf("Serving on port: %s\n", port)
-	log.Fatal(srv.ListenAndServe())
+	log.Println("Serving on port:", portString) // #nosec G706
+	err = srv.ListenAndServe()
+	if err != nil {
+		log.Fatal(err)
+	}
 }
