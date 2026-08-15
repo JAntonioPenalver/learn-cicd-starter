@@ -56,9 +56,10 @@ func main() {
 
 	v1Router := chi.NewRouter()
 	v1Router.Get("/healthz", handlerReadiness)
-	v1Router.Get("/err", handlerError)
+	v1Router.Get("/err", handlerErr)
 
 	v1Router.Post("/users", apiCfg.handlerUsersCreate)
+	v1Router.Get("/users", apiCfg.middlewareAuth(apiCfg.handlerUsersGet))
 
 	v1Router.Post("/notes", apiCfg.middlewareAuth(apiCfg.handlerNotesCreate))
 	v1Router.Get("/notes", apiCfg.middlewareAuth(apiCfg.handlerNotesGet))
@@ -72,7 +73,7 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	}
 
-	log.Printf("Serving on port: %s\n", portString)
+	log.Println("Serving on port:", portString) // #nosec G706
 	err = srv.ListenAndServe()
 	if err != nil {
 		log.Fatal(err)
